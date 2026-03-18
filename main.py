@@ -1,13 +1,21 @@
 import os
 import httpx
+import inspect
 from mcp.server.fastmcp import FastMCP
 
-# On initialise le serveur
+# Initialisation du serveur FastMCP
 mcp = FastMCP("JSearch Connector")
 
 @mcp.tool()
 async def search_jobs(query: str, location: str = "", remote_jobs_only: bool = False) -> str:
-    # Récupération clé API
+    """
+    Interroge l'API JSearch pour trouver des offres d'emploi.
+    
+    Args:
+        query: Le mot-clé de recherche (ex: 'Python developer', 'Data Scientist')
+        location: Le lieu de recherche optionnel (ex: 'Paris', 'Remote', 'London')
+        remote_jobs_only: Si True, retourne uniquement des offres en télétravail.
+    """
     api_key = os.environ.get("JSEARCH_API_KEY")
     if not api_key:
         return "Erreur : La variable d'environnement JSEARCH_API_KEY n'est pas configurée sur le serveur."
@@ -30,6 +38,7 @@ async def search_jobs(query: str, location: str = "", remote_jobs_only: bool = F
         "num_pages": "1"
     }
 
+    # Optimisation des recherches par pays, optionnelle mais pratique pour des requêtes génériques
     loc_lower = location.lower()
     if "france" in loc_lower or "paris" in loc_lower:
         params["country"] = "fr"
@@ -53,6 +62,7 @@ async def search_jobs(query: str, location: str = "", remote_jobs_only: bool = F
                 return f"Aucune offre d'emploi trouvée pour la recherche : '{search_query}'"
                 
             results = []
+            # On retourne les 5 premières annonces pour ne pas saturer le contexte LLM.
             for job in jobs[:5]:
                 title = job.get("job_title", "Titre inconnu")
                 employer = job.get("employer_name", "Employeur inconnu")
@@ -86,4 +96,60 @@ async def search_jobs(query: str, location: str = "", remote_jobs_only: bool = F
     except Exception as e:
         return f"Erreur inattendue : {str(e)}"
 
-# /!\ IL N'Y A PLUS DE VARIABLE 'app' ICI /!\
+# ==============================================================================
+# HACK INFAILLIBLE : EXPOSITION DE L'APPLICATION ASGI (STARLETTE/FASTAPI)
+# ==============================================================================
+# Les récentes versions du SDK natif (mcp >= 1.26.x) ont modifié plusieurs comportements:
+# 1. get_starlette_app() a été supprimé ou renommé.
+# 2. connect_sse est parfois renvoyé comme `tuple` (causant TypeError en async context).
+# 3. Les applications sont parfois cachées dans des attibuts privés.
+# Ce getter dynamique balaie et essaie tous les points de montage asgi.
+
+def get_mcp_asgi_app(mcp_instance):
+    """
+    Extrait dynamiquement l'application ASGI compatible Starlette depuis une instance FastMCP.
+    Résout définitivement l'erreur "AttributeError: 'FastMCP' object has no attribute 'get_starlette_app'".
+    """
+    
+    # 1. Utilisation native ou recommandée par certaines versions :
+    if hasattr(mcp_instance, "get_starlette_app"):
+        return mcp_instance.get_starlette_app()
+    
+    if hasattr(mcp_instance, "get_asgi_app"):
+        return mcp_instance.get_asgi_app()
+    
+    if hasattr(mcp_instance, "create_sse_app"):
+        return mcp_instance.create_sse_app()
+        
+    # 2. Fouille approfondie des sous-composants souvent injectés par la bibliothèque récente :
+    if hasattr(mcp_instance, "_mcp_server"):
+        inner = mcp_instance._mcp_server
+        if hasattr(inner, "get_asgi_app"):
+            return inner.get_asgi_app()
+        if hasattr(inner, "get_starlette_app"):
+            return inner.get_starlette_app()
+            
+    # 3. Accès direct à la propriété privée de l'application (fallback classique) :
+    if hasattr(mcp_instance, "_app"):
+        return mcp_instance._app
+        
+    # 4. Fallback de dernière chance si l'instance FastMCP elle-même implémente __call__ ASGI :
+    if callable(mcp_instance):
+        try:
+            sig = inspect.signature(mcp_instance.__call__)
+            # Un ASGI a la signature (scope, receive, send)
+            if len(sig.parameters) >= 3:
+                return mcp_instance
+        except Exception:
+            pass
+            
+    # 5. Si vraiment tout a échoué, on génère un message qui nous donnera les bons attributs dans les logs de Render.
+    available_attrs = dir(mcp_instance)
+    raise RuntimeError(
+        f"Impossible d'extraire l'application ASGI pour uvicorn.\n"
+        f"Attributs disponibles sur l'instance : {available_attrs}\n\n"
+        f"Désolé, la structure interne de mcp/FastMCP a encore muté."
+    )
+
+# L'application Uvicorn s'accroche enfin de manière sécurisée ici
+app = get_mcp_asgi_app(mcp)
